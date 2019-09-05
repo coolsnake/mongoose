@@ -140,6 +140,7 @@ struct mg_http_multipart_stream {
   void *user_data;
   enum mg_http_multipart_stream_state state;
   int processing_part;
+  int data_avail;
 };
 
 struct mg_reverse_proxy_data {
@@ -176,20 +177,29 @@ struct mg_http_proto_data {
   size_t rcvd; /* How many bytes we have received. */
 };
 
-static void mg_http_conn_destructor(void *proto_data);
+static void mg_http_proto_data_destructor(void *proto_data);
+
 struct mg_connection *mg_connect_http_base(
     struct mg_mgr *mgr, MG_CB(mg_event_handler_t ev_handler, void *user_data),
     struct mg_connect_opts opts, const char *scheme1, const char *scheme2,
     const char *scheme_ssl1, const char *scheme_ssl2, const char *url,
     struct mg_str *path, struct mg_str *user_info, struct mg_str *host);
 
+MG_INTERNAL struct mg_http_proto_data *mg_http_create_proto_data(
+    struct mg_connection *c) {
+  /* If we have proto data from previous connection, flush it. */
+  if (c->proto_data != NULL) {
+    void *pd = c->proto_data;
+    c->proto_data = NULL;
+    mg_http_proto_data_destructor(pd);
+  }
+  c->proto_data = MG_CALLOC(1, sizeof(struct mg_http_proto_data));
+  c->proto_data_destructor = mg_http_proto_data_destructor;
+  return (struct mg_http_proto_data *) c->proto_data;
+}
+
 static struct mg_http_proto_data *mg_http_get_proto_data(
     struct mg_connection *c) {
-  if (c->proto_data == NULL) {
-    c->proto_data = MG_CALLOC(1, sizeof(struct mg_http_proto_data));
-    c->proto_data_destructor = mg_http_conn_destructor;
-  }
-
   return (struct mg_http_proto_data *) c->proto_data;
 }
 
@@ -245,7 +255,7 @@ static void mg_http_free_reverse_proxy_data(struct mg_reverse_proxy_data *rpd) {
   }
 }
 
-static void mg_http_conn_destructor(void *proto_data) {
+static void mg_http_proto_data_destructor(void *proto_data) {
   struct mg_http_proto_data *pd = (struct mg_http_proto_data *) proto_data;
 #if MG_ENABLE_FILESYSTEM
   mg_http_free_proto_data_file(&pd->file);
@@ -518,7 +528,8 @@ static void mg_http_transfer_file_data(struct mg_connection *nc) {
       /* Rate-limited */
     }
     if (pd->file.sent >= pd->file.cl) {
-      LOG(LL_DEBUG, ("%p done, %d bytes", nc, (int) pd->file.sent));
+      LOG(LL_DEBUG, ("%p done, %d bytes, ka %d", nc, (int) pd->file.sent,
+                     pd->file.keepalive));
       if (!pd->file.keepalive) nc->flags |= MG_F_SEND_AND_CLOSE;
       mg_http_free_proto_data_file(&pd->file);
     }
@@ -654,11 +665,11 @@ struct mg_http_endpoint *mg_http_get_endpoint_handler(struct mg_connection *nc,
   int matched, matched_max = 0;
   struct mg_http_endpoint *ep;
 
-  if (nc == NULL) {
-    return NULL;
-  }
+  if (nc == NULL) return NULL;
 
   pd = mg_http_get_proto_data(nc);
+
+  if (pd == NULL) return NULL;
 
   ep = pd->endpoints;
   while (ep != NULL) {
@@ -731,13 +742,13 @@ void mg_http_handler(struct mg_connection *nc, int ev,
   if (ev == MG_EV_CLOSE) {
 #if MG_ENABLE_HTTP_CGI
     /* Close associated CGI forwarder connection */
-    if (pd->cgi.cgi_nc != NULL) {
+    if (pd != NULL && pd->cgi.cgi_nc != NULL) {
       pd->cgi.cgi_nc->user_data = NULL;
       pd->cgi.cgi_nc->flags |= MG_F_CLOSE_IMMEDIATELY;
     }
 #endif
 #if MG_ENABLE_HTTP_STREAMING_MULTIPART
-    if (pd->mp_stream.boundary != NULL) {
+    if (pd != NULL && pd->mp_stream.boundary != NULL) {
       /*
        * Multipart message is in progress, but connection is closed.
        * Finish part and request with an error flag.
@@ -758,39 +769,54 @@ void mg_http_handler(struct mg_connection *nc, int ev,
         if (io->len > 0 &&
             (req_len = mg_parse_http(io->buf, io->len, hm, is_req)) > 0) {
       /*
-      * For HTTP messages without Content-Length, always send HTTP message
-      * before MG_EV_CLOSE message.
-      */
+       * For HTTP messages without Content-Length, always send HTTP message
+       * before MG_EV_CLOSE message.
+       */
       int ev2 = is_req ? MG_EV_HTTP_REQUEST : MG_EV_HTTP_REPLY;
       hm->message.len = io->len;
       hm->body.len = io->buf + io->len - hm->body.p;
       deliver_chunk(nc, hm, req_len);
       mg_http_call_endpoint_handler(nc, ev2, hm);
     }
-    pd->rcvd = 0;
+    if (pd != NULL && pd->endpoint_handler != NULL &&
+        pd->endpoint_handler != nc->handler) {
+      mg_call(nc, pd->endpoint_handler, nc->user_data, ev, NULL);
+    }
   }
 
 #if MG_ENABLE_FILESYSTEM
-  if (pd->file.fp != NULL) {
+  if (pd != NULL && pd->file.fp != NULL) {
     mg_http_transfer_file_data(nc);
   }
 #endif
 
   mg_call(nc, nc->handler, nc->user_data, ev, ev_data);
 
+#if MG_ENABLE_HTTP_STREAMING_MULTIPART
+  if (pd != NULL && pd->mp_stream.boundary != NULL &&
+      (ev == MG_EV_RECV || ev == MG_EV_POLL)) {
+    if (ev == MG_EV_RECV) {
+      pd->rcvd += *(int *) ev_data;
+      mg_http_multipart_continue(nc);
+    } else if (pd->mp_stream.data_avail) {
+      /* Try re-delivering the data. */
+      mg_http_multipart_continue(nc);
+    }
+    return;
+  }
+#endif /* MG_ENABLE_HTTP_STREAMING_MULTIPART */
+
   if (ev == MG_EV_RECV) {
     struct mg_str *s;
-    pd->rcvd += *(int *) ev_data;
-
-#if MG_ENABLE_HTTP_STREAMING_MULTIPART
-    if (pd->mp_stream.boundary != NULL) {
-      mg_http_multipart_continue(nc);
-      return;
-    }
-#endif /* MG_ENABLE_HTTP_STREAMING_MULTIPART */
 
   again:
     req_len = mg_parse_http(io->buf, io->len, hm, is_req);
+
+    if (req_len > 0) {
+      /* New request - new proto data */
+      pd = mg_http_create_proto_data(nc);
+      pd->rcvd = io->len;
+    }
 
     if (req_len > 0 &&
         (s = mg_get_http_header(hm, "Transfer-Encoding")) != NULL &&
@@ -816,16 +842,23 @@ void mg_http_handler(struct mg_connection *nc, int ev,
       /* Do nothing, request is not yet fully buffered */
     }
 #if MG_ENABLE_HTTP_WEBSOCKET
-    else if (nc->listener == NULL &&
-             mg_get_http_header(hm, "Sec-WebSocket-Accept")) {
+    else if (nc->listener == NULL && (nc->flags & MG_F_IS_WEBSOCKET)) {
       /* We're websocket client, got handshake response from server. */
-      /* TODO(lsm): check the validity of accept Sec-WebSocket-Accept */
-      mbuf_remove(io, req_len);
-      nc->proto_handler = mg_ws_handler;
-      nc->flags |= MG_F_IS_WEBSOCKET;
-      mg_call(nc, nc->handler, nc->user_data, MG_EV_WEBSOCKET_HANDSHAKE_DONE,
-              NULL);
-      mg_ws_handler(nc, MG_EV_RECV, ev_data MG_UD_ARG(user_data));
+      DBG(("%p WebSocket upgrade code %d", nc, hm->resp_code));
+      if (hm->resp_code == 101 &&
+          mg_get_http_header(hm, "Sec-WebSocket-Accept")) {
+        /* TODO(lsm): check the validity of accept Sec-WebSocket-Accept */
+        mg_call(nc, nc->handler, nc->user_data, MG_EV_WEBSOCKET_HANDSHAKE_DONE,
+                hm);
+        mbuf_remove(io, req_len);
+        nc->proto_handler = mg_ws_handler;
+        mg_ws_handler(nc, MG_EV_RECV, ev_data MG_UD_ARG(user_data));
+      } else {
+        mg_call(nc, nc->handler, nc->user_data, MG_EV_WEBSOCKET_HANDSHAKE_DONE,
+                hm);
+        nc->flags |= MG_F_CLOSE_IMMEDIATELY;
+        mbuf_remove(io, req_len);
+      }
     } else if (nc->listener != NULL &&
                (vec = mg_get_http_header(hm, "Sec-WebSocket-Key")) != NULL) {
       struct mg_http_endpoint *ep;
@@ -856,7 +889,7 @@ void mg_http_handler(struct mg_connection *nc, int ev,
           mg_ws_handshake(nc, vec, hm);
         }
         mg_call(nc, nc->handler, nc->user_data, MG_EV_WEBSOCKET_HANDSHAKE_DONE,
-                NULL);
+                hm);
         mg_ws_handler(nc, MG_EV_RECV, ev_data MG_UD_ARG(user_data));
       }
     }
@@ -896,18 +929,7 @@ void mg_http_handler(struct mg_connection *nc, int ev,
       /* If this is a CGI request, we are not done either. */
       if (pd->cgi.cgi_nc != NULL) request_done = 0;
 #endif
-      if (request_done) {
-        /* This request is done but we may receive another on this connection.
-         */
-        mg_http_conn_destructor(pd);
-        nc->proto_data = NULL;
-        if (io->len > 0) {
-          /* We already have data for the next one, restart parsing. */
-          pd = mg_http_get_proto_data(nc);
-          pd->rcvd = io->len;
-          goto again;
-        }
-      }
+      if (request_done && io->len > 0) goto again;
     }
   }
 }
@@ -983,8 +1005,9 @@ exit_mp:
 
 #define CONTENT_DISPOSITION "Content-Disposition: "
 
-static void mg_http_multipart_call_handler(struct mg_connection *c, int ev,
-                                           const char *data, size_t data_len) {
+static size_t mg_http_multipart_call_handler(struct mg_connection *c, int ev,
+                                             const char *data,
+                                             size_t data_len) {
   struct mg_http_multipart_part mp;
   struct mg_http_proto_data *pd = mg_http_get_proto_data(c);
   memset(&mp, 0, sizeof(mp));
@@ -994,8 +1017,11 @@ static void mg_http_multipart_call_handler(struct mg_connection *c, int ev,
   mp.user_data = pd->mp_stream.user_data;
   mp.data.p = data;
   mp.data.len = data_len;
+  mp.num_data_consumed = data_len;
   mg_call(c, pd->endpoint_handler, c->user_data, ev, &mp);
   pd->mp_stream.user_data = mp.user_data;
+  pd->mp_stream.data_avail = (mp.num_data_consumed != data_len);
+  return mp.num_data_consumed;
 }
 
 static int mg_http_multipart_finalize(struct mg_connection *c) {
@@ -1133,19 +1159,25 @@ static int mg_http_multipart_continue_wait_for_chunk(struct mg_connection *c) {
 
   boundary = c_strnstr(io->buf, pd->mp_stream.boundary, io->len);
   if (boundary == NULL) {
-    int data_size = (io->len - (pd->mp_stream.boundary_len + 6));
-    if (data_size > 0) {
-      mg_http_multipart_call_handler(c, MG_EV_HTTP_PART_DATA, io->buf,
-                                     data_size);
-      mbuf_remove(io, data_size);
+    int data_len = (io->len - (pd->mp_stream.boundary_len + 6));
+    if (data_len > 0) {
+      size_t consumed = mg_http_multipart_call_handler(
+          c, MG_EV_HTTP_PART_DATA, io->buf, (size_t) data_len);
+      mbuf_remove(io, consumed);
     }
     return 0;
   } else if (boundary != NULL) {
-    int data_size = (boundary - io->buf - 4);
-    mg_http_multipart_call_handler(c, MG_EV_HTTP_PART_DATA, io->buf, data_size);
-    mbuf_remove(io, (boundary - io->buf));
-    pd->mp_stream.state = MPS_WAITING_FOR_BOUNDARY;
-    return 1;
+    size_t data_len = ((size_t)(boundary - io->buf) - 4);
+    size_t consumed = mg_http_multipart_call_handler(c, MG_EV_HTTP_PART_DATA,
+                                                     io->buf, data_len);
+    mbuf_remove(io, consumed);
+    if (consumed == data_len) {
+      mbuf_remove(io, 4);
+      pd->mp_stream.state = MPS_WAITING_FOR_BOUNDARY;
+      return 1;
+    } else {
+      return 0;
+    }
   } else {
     return 0;
   }
@@ -1923,7 +1955,7 @@ int mg_check_digest_auth(struct mg_str method, struct mg_str uri,
                          struct mg_str nc, struct mg_str nonce,
                          struct mg_str auth_domain, FILE *fp) {
   char buf[128], f_user[sizeof(buf)], f_ha1[sizeof(buf)], f_domain[sizeof(buf)];
-  char expected_response[33];
+  char exp_resp[33];
 
   /*
    * Read passwords file line by line. If should have htdigest format,
@@ -1937,11 +1969,10 @@ int mg_check_digest_auth(struct mg_str method, struct mg_str uri,
       /* Username and domain matched, check the password */
       mg_mkmd5resp(method.p, method.len, uri.p, uri.len, f_ha1, strlen(f_ha1),
                    nonce.p, nonce.len, nc.p, nc.len, cnonce.p, cnonce.len,
-                   qop.p, qop.len, expected_response);
-      LOG(LL_DEBUG,
-          ("%.*s %s %.*s %s", (int) username.len, username.p, f_domain,
-           (int) response.len, response.p, expected_response));
-      return mg_ncasecmp(response.p, expected_response, response.len) == 0;
+                   qop.p, qop.len, exp_resp);
+      LOG(LL_DEBUG, ("%.*s %s %.*s %s", (int) username.len, username.p,
+                     f_domain, (int) response.len, response.p, exp_resp));
+      return mg_ncasecmp(response.p, exp_resp, strlen(exp_resp)) == 0;
     }
   }
 
@@ -2536,9 +2567,11 @@ void mg_http_send_digest_auth_request(struct mg_connection *c,
             domain, (unsigned long) mg_time());
 }
 
-static void mg_http_send_options(struct mg_connection *nc) {
+static void mg_http_send_options(struct mg_connection *nc,
+                                 struct mg_serve_http_opts *opts) {
+  mg_send_response_line(nc, 200, opts->extra_headers);
   mg_printf(nc, "%s",
-            "HTTP/1.1 200 OK\r\nAllow: GET, POST, HEAD, CONNECT, OPTIONS"
+            "Allow: GET, POST, HEAD, CONNECT, OPTIONS"
 #if MG_ENABLE_HTTP_WEBDAV
             ", MKCOL, PUT, DELETE, PROPFIND, MOVE\r\nDAV: 1,2"
 #endif
@@ -2645,7 +2678,7 @@ MG_INTERNAL void mg_send_http_file(struct mg_connection *nc, char *path,
 #endif
 #endif /* MG_ENABLE_HTTP_WEBDAV */
   } else if (!mg_vcmp(&hm->method, "OPTIONS")) {
-    mg_http_send_options(nc);
+    mg_http_send_options(nc, opts);
   } else if (is_directory && index_file == NULL) {
 #if MG_ENABLE_DIRECTORY_LISTING
     if (strcmp(opts->enable_directory_listing, "yes") == 0) {
@@ -3036,6 +3069,7 @@ void mg_register_http_endpoint_opt(struct mg_connection *nc,
   if (new_ep == NULL) return;
 
   pd = mg_http_get_proto_data(nc);
+  if (pd == NULL) pd = mg_http_create_proto_data(nc);
   new_ep->uri_pattern = mg_strdup(mg_mk_str(uri_path));
   if (opts.auth_domain != NULL && opts.auth_file != NULL) {
     new_ep->auth_domain = strdup(opts.auth_domain);
